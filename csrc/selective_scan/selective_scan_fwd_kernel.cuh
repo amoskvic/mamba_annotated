@@ -4,15 +4,31 @@
 
 #pragma once
 
-#include <c10/util/BFloat16.h>
-#include <c10/util/Half.h>
+/* Define the BrainFloat format + some conversions.
+    see details here https://github.com/pytorch/pytorch/blob/main/c10/util/BFloat16.h
+    Note: has some ROCm-specific code.
+*/
+#include <c10/util/BFloat16.h> 
+
+/*
+Define the half-precision format. Notably better documented than BF16. Interestingly, computations are
+performed by converting to 32 bits. For faster computations, CUDA intrinsics need to be invoked directly by the user.                             
+*/
+#include <c10/util/Half.h> 
+
 #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
 
-#include <cub/block/block_load.cuh>
-#include <cub/block/block_store.cuh>
-#include <cub/block/block_scan.cuh>
+/*
+CUB library imports. In general, CUB comes with a number of pre-made algorithms (including scan),
+intended to make CUDA code easier to write and more modular/composable. See https://nvidia.github.io/cccl/cub/  
+*/
+                                    // From CUB docs:
+#include <cub/block/block_load.cuh> // ... collective data movement methods for loading a linear segment of items from memory into a blocked arrangement across a CUDA thread block.
+#include <cub/block/block_store.cuh> // ... collective data movement methods for writing a blocked arrangement of items partitioned across a CUDA thread block to a linear segment of memory.
+#include <cub/block/block_scan.cuh> // ... collective methods for computing a parallel prefix sum/scan of items partitioned across a CUDA thread block.
 
-#include "selective_scan.h"
+
+#include "selective_scan.h" 
 #include "selective_scan_common.h"
 #include "static_switch.h"
 
