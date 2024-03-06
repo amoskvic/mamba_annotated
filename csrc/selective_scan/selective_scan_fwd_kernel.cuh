@@ -28,9 +28,14 @@ intended to make CUDA code easier to write and more modular/composable. See http
 #include <cub/block/block_scan.cuh> // ... collective methods for computing a parallel prefix sum/scan of items partitioned across a CUDA thread block.
 
 
-#include "selective_scan.h" 
-#include "selective_scan_common.h"
-#include "static_switch.h"
+#include "selective_scan.h" // importantly, defines SSM parameter structures both for fwd and bwd.
+#include "selective_scan_common.h" // redefines a + operator for 2,3, & 4-element float vectors (float2, float3, ...) + a BytesToType helper struct
+                                   // Also defines some type converters.
+                                   // Perhaps most importantly, defines a SSMScanOp template which gives the key scan 
+                                   // element (a pair for real-valued, a quadruple for complex ones) needed for the 
+                                   // parallel scan algorithm to work.
+
+#include "static_switch.h" // conditional code execution.
 
 template<int kNThreads_, int kNItems_, int kNRows_, bool kIsEvenLen_,
          bool kIsVariableB_, bool kIsVariableC_,

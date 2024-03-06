@@ -29,9 +29,9 @@ inline __device__ float4 operator+(const float4 & a, const float4 & b){
 template<int BYTES> struct BytesToType {};
 
 template<> struct BytesToType<16> {
-    using Type = uint4;
-    static_assert(sizeof(Type) == 16);
-};
+    using Type = uint4; // built-in CUDA vector datatype with 4 numbers, that's why it's so large.
+    static_assert(sizeof(Type) == 16); // i.e. uint8_t is 1 byte, while uint4 is 16 bytes!
+};                                     // see https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html?highlight=uint4#char-short-int-long-longlong-float-double
 
 template<> struct BytesToType<8> {
     using Type = uint64_t;
