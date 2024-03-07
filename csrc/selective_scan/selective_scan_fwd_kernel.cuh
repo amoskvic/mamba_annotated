@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright (c) 2023, Tri Dao.
+ * Copyright (c) 2023, Tri Dao.+
  ******************************************************************************/
 
 #pragma once
@@ -35,47 +35,65 @@ intended to make CUDA code easier to write and more modular/composable. See http
                                    // element (a pair for real-valued, a quadruple for complex ones) needed for the 
                                    // parallel scan algorithm to work.
 
-#include "static_switch.h" // conditional code execution.
+#include "static_switch.h" // conditional code execution lambda macro.
 
 template<int kNThreads_, int kNItems_, int kNRows_, bool kIsEvenLen_,
          bool kIsVariableB_, bool kIsVariableC_,
          bool kHasZ_, typename input_t_, typename weight_t_>
-struct Selective_Scan_fwd_kernel_traits {
+struct Selective_Scan_fwd_kernel_traits { 
     static_assert(kNItems_ % 4 == 0);
     using input_t = input_t_;
     using weight_t = weight_t_;
     static constexpr int kNThreads = kNThreads_;
-    // Setting MinBlocksPerMP to be 3 (instead of 2) for 128 threads improves occupancy.
-    static constexpr int kMinBlocks = kNThreads < 128 ? 5 : 3;
-    static constexpr int kNItems = kNItems_;
-    static constexpr int kNRows = kNRows_;
-    static constexpr int kNBytes = sizeof(input_t);
+    // Setting MinBlocksPerMP to be 3 (instead of 2) for 128 threads improves occupancy. // original comment
+    static constexpr int kMinBlocks = kNThreads < 128 ? 5 : 3; // TODO: Needs to be adjusted for AMD
+    static constexpr int kNItems = kNItems_; // TODO
+    static constexpr int kNRows = kNRows_; // TODO
+    static constexpr int kNBytes = sizeof(input_t); // Selecting the precision regime
     static_assert(kNBytes == 2 || kNBytes == 4);
     static constexpr int kNElts = kNBytes == 4 ? 4 : std::min(8, kNItems);
     static_assert(kNItems % kNElts == 0);
-    static constexpr int kNLoads = kNItems / kNElts;
+    static constexpr int kNLoads = kNItems / kNElts; // TODO
     static constexpr bool kIsComplex = std::is_same_v<weight_t, complex_t>;
     static constexpr bool kIsEvenLen = kIsEvenLen_;
-    static constexpr bool kIsVariableB = kIsVariableB_;
-    static constexpr bool kIsVariableC = kIsVariableC_;
-    static constexpr bool kHasZ = kHasZ_;
+    static constexpr bool kIsVariableB = kIsVariableB_; // Whether we have selection applied to B
+    static constexpr bool kIsVariableC = kIsVariableC_; // whether we have selection applied to C
+    static constexpr bool kHasZ = kHasZ_; // TODO
 
     static constexpr bool kDirectIO = kIsEvenLen && kNLoads == 1;
 
     using vec_t = typename BytesToType<kNBytes * kNElts>::Type;
     using scan_t = std::conditional_t<!kIsComplex, float2, float4>;
+
+
+    // Below-instantiating cub templates for different ways of loading/storing data.
+
+    // cub::BLOCK_LOAD_WARP_TRANSPOSE defines how the data is loaded.
+    // From docs: A striped arrangement of data is read efficiently from memory and then locally transposed into a blocked arrangement.
+    // More on memory arrangements: https://nvidia.github.io/cccl/cub/index.html#flexible-data-arrangement
+    // In general, the docs for these constants can be found in Namespaces->cub->Enums
     using BlockLoadT = cub::BlockLoad<input_t, kNThreads, kNItems, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+    
+    // From docs: A blocked arrangement of data is read directly from memory. The utilization of memory transactions (coalescing) decreases as the access stride between threads increases (i.e., the number items per thread).
     using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, kNLoads,
         !kDirectIO ? cub::BLOCK_LOAD_WARP_TRANSPOSE : cub::BLOCK_LOAD_DIRECT>;
+
     using BlockLoadWeightT = cub::BlockLoad<input_t, kNThreads, !kIsComplex ? kNItems : kNItems * 2, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
     using BlockLoadWeightVecT = cub::BlockLoad<vec_t, kNThreads, !kIsComplex ? kNLoads : kNLoads * 2,
         !kDirectIO ? cub::BLOCK_LOAD_WARP_TRANSPOSE  : cub::BLOCK_LOAD_DIRECT>;
     using BlockStoreT = cub::BlockStore<input_t, kNThreads, kNItems, cub::BLOCK_STORE_WARP_TRANSPOSE>;
     using BlockStoreVecT = cub::BlockStore<vec_t, kNThreads, kNLoads,
         !kDirectIO ? cub::BLOCK_STORE_WARP_TRANSPOSE : cub::BLOCK_STORE_DIRECT>;
-    // using BlockScanT = cub::BlockScan<scan_t, kNThreads, cub::BLOCK_SCAN_RAKING_MEMOIZE>;
-    // using BlockScanT = cub::BlockScan<scan_t, kNThreads, cub::BLOCK_SCAN_RAKING>;
+    
+    // using BlockScanT = cub::BlockScan<scan_t, kNThreads, cub::BLOCK_SCAN_RAKING_MEMOIZE>; // Commented out in the original code.
+    // using BlockScanT = cub::BlockScan<scan_t, kNThreads, cub::BLOCK_SCAN_RAKING>; // Commented out in the original code.
+
+    // Specifying block scan parameters.
+    // See https://nvidia.github.io/cccl/cub/api/classcub_1_1BlockScan.html
+    // cub::BLOCK_SCAN_WARP_SCANS indicates a specific version of cub's implementation of the prefix scan/sum.
     using BlockScanT = cub::BlockScan<scan_t, kNThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+
+    // Below - determining the buffer size needed to transfer/store relevant data. TODO: double-check the usage
     static constexpr int kSmemIOSize = std::max({sizeof(typename BlockLoadT::TempStorage),
                                                  sizeof(typename BlockLoadVecT::TempStorage),
                                                  (int(kIsVariableB) + int(kIsVariableC)) * sizeof(typename BlockLoadWeightT::TempStorage),
@@ -85,8 +103,12 @@ struct Selective_Scan_fwd_kernel_traits {
     static constexpr int kSmemSize = kSmemIOSize + sizeof(typename BlockScanT::TempStorage);
 };
 
+
+// Regarding __launch_bounds__: the signature is __launch_bounds__(maxThreadsPerBlock, minBlocksPerMultiprocessor, maxBlocksPerCluster)
+// Used to more finely tune/optimize GPU resource allocation
+// See https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#launch-bounds for more.
 template<typename Ktraits>
-__global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks)
+__global__ __launch_bounds__(Ktraits::kNThreads, Ktraits::kMinBlocks) 
 void selective_scan_fwd_kernel(SSMParamsBase params) {
     constexpr bool kIsComplex = Ktraits::kIsComplex;
     constexpr bool kIsVariableB = Ktraits::kIsVariableB;
@@ -98,26 +120,33 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     constexpr bool kDirectIO = Ktraits::kDirectIO;
     using input_t = typename Ktraits::input_t;
     using weight_t = typename Ktraits::weight_t;
-    using scan_t = typename Ktraits::scan_t;
-
-    // Shared memory.
+    using scan_t = typename Ktraits::scan_t; // The type of the scan variable, will be float2 or float4 vector depending on 
+                                             // whether we're working with a complex case or not.
+=
+    // Shared memory. // original comment
     extern __shared__ char smem_[];
-    // cast to lvalue reference of expected type
-    // char *smem_loadstorescan = smem_ + 2 * MAX_DSTATE * sizeof(weight_t);
-    // auto& smem_load = reinterpret_cast<typename BlockLoadT::TempStorage&>(smem_ + 2 * MAX_DSTATE * sizeof(weight_t));
-    // auto& smem_load = reinterpret_cast<typename BlockLoadT::TempStorage&>(smem_loadstorescan);
+    // cast to lvalue reference of expected type // original comment
+    // char *smem_loadstorescan = smem_ + 2 * MAX_DSTATE * sizeof(weight_t); // original comment
+    // auto& smem_load = reinterpret_cast<typename BlockLoadT::TempStorage&>(smem_ + 2 * MAX_DSTATE * sizeof(weight_t)); // original comment
+    // auto& smem_load = reinterpret_cast<typename BlockLoadT::TempStorage&>(smem_loadstorescan); // original comment
+
+
+    // Below - notice that Ktraits will be an instance of a structure defined above (Selective_Scan_fwd_kernel_traits)
+    // So internally it will have a BlockLoadT member, defined so as to fit the specific setup in that particular traits object.
+    // Similarly for other lines below.
     auto& smem_load = reinterpret_cast<typename Ktraits::BlockLoadT::TempStorage&>(smem_);
     auto& smem_load_weight = reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage&>(smem_);
     auto& smem_load_weight1 = *reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage*>(smem_ + sizeof(typename Ktraits::BlockLoadWeightT::TempStorage));
     auto& smem_store = reinterpret_cast<typename Ktraits::BlockStoreT::TempStorage&>(smem_);
     auto& smem_scan = *reinterpret_cast<typename Ktraits::BlockScanT::TempStorage*>(smem_ + Ktraits::kSmemIOSize);
-    // weight_t *smem_a = reinterpret_cast<weight_t *>(smem_ + smem_loadstorescan_size);
-    // weight_t *smem_bc = reinterpret_cast<weight_t *>(smem_a + MAX_DSTATE);
+    // weight_t *smem_a = reinterpret_cast<weight_t *>(smem_ + smem_loadstorescan_size); // original comment
+    // weight_t *smem_bc = reinterpret_cast<weight_t *>(smem_a + MAX_DSTATE); // original comment
     scan_t *smem_running_prefix = reinterpret_cast<scan_t *>(smem_ + Ktraits::kSmemSize);
 
     const int batch_id = blockIdx.x;
     const int dim_id = blockIdx.y;
     const int group_id = dim_id / (params.dim_ngroups_ratio);
+
     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
         + dim_id * kNRows * params.u_d_stride;
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + batch_id * params.delta_batch_stride
