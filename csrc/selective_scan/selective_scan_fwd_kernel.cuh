@@ -46,9 +46,9 @@ struct Selective_Scan_fwd_kernel_traits {
     using weight_t = weight_t_;
     static constexpr int kNThreads = kNThreads_;
     // Setting MinBlocksPerMP to be 3 (instead of 2) for 128 threads improves occupancy. // original comment
-    static constexpr int kMinBlocks = kNThreads < 128 ? 5 : 3; // TODO: Needs to be adjusted for AMD
+    static constexpr int kMinBlocks = kNThreads < 128 ? 5 : 3; // TODO: Potentially needs to be adjusted for AMD
     static constexpr int kNItems = kNItems_; // TODO
-    static constexpr int kNRows = kNRows_; // TODO
+    static constexpr int kNRows = kNRows_; // How many rows to process per block. grid size is (batch_size, dim/kNRows). Currently set to 1 and only tested with 1, so not really important. Potential for optimization.
     static constexpr int kNBytes = sizeof(input_t); // Selecting the precision regime
     static_assert(kNBytes == 2 || kNBytes == 4);
     static constexpr int kNElts = kNBytes == 4 ? 4 : std::min(8, kNItems);
@@ -56,9 +56,9 @@ struct Selective_Scan_fwd_kernel_traits {
     static constexpr int kNLoads = kNItems / kNElts; // TODO
     static constexpr bool kIsComplex = std::is_same_v<weight_t, complex_t>;
     static constexpr bool kIsEvenLen = kIsEvenLen_;
-    static constexpr bool kIsVariableB = kIsVariableB_; // Whether we have selection applied to B
-    static constexpr bool kIsVariableC = kIsVariableC_; // whether we have selection applied to C
-    static constexpr bool kHasZ = kHasZ_; // TODO
+    static constexpr bool kIsVariableB = kIsVariableB_; // Whether we have selection applied to B. Only tested with True
+    static constexpr bool kIsVariableC = kIsVariableC_; // whether we have selection applied to C. Only tested with True
+    static constexpr bool kHasZ = kHasZ_; // TODO. Interestingly, only tested with True in test_selective_scan.py
 
     static constexpr bool kDirectIO = kIsEvenLen && kNLoads == 1;
 
@@ -113,17 +113,23 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     constexpr bool kIsComplex = Ktraits::kIsComplex;
     constexpr bool kIsVariableB = Ktraits::kIsVariableB;
     constexpr bool kIsVariableC = Ktraits::kIsVariableC;
-    constexpr bool kHasZ = Ktraits::kHasZ;
+    constexpr bool kHasZ = Ktraits::kHasZ; // TODO
     constexpr int kNThreads = Ktraits::kNThreads;
-    constexpr int kNItems = Ktraits::kNItems;
-    constexpr int kNRows = Ktraits::kNRows;
-    constexpr bool kDirectIO = Ktraits::kDirectIO;
+    constexpr int kNItems = Ktraits::kNItems; // TODO
+    constexpr int kNRows = Ktraits::kNRows; // Is actualy set to 1 in the kernel launch and is not tested with other values.
+    constexpr bool kDirectIO = Ktraits::kDirectIO; // TODO
     using input_t = typename Ktraits::input_t;
     using weight_t = typename Ktraits::weight_t;
     using scan_t = typename Ktraits::scan_t; // The type of the scan variable, will be float2 or float4 vector depending on 
                                              // whether we're working with a complex case or not.
 =
     // Shared memory. // original comment
+    // See more here https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/
+    // "Dynamic Shared Memory" section in particular.
+    // Note that when the memory size is not specified during shared memory array creation,
+    // It must be specified during the kernel launch.
+    // kSmemSize parameter holds the size sufficient to guarantee that we can store all we need.
+
     extern __shared__ char smem_[];
     // cast to lvalue reference of expected type // original comment
     // char *smem_loadstorescan = smem_ + 2 * MAX_DSTATE * sizeof(weight_t); // original comment
@@ -131,9 +137,12 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     // auto& smem_load = reinterpret_cast<typename BlockLoadT::TempStorage&>(smem_loadstorescan); // original comment
 
 
-    // Below - notice that Ktraits will be an instance of a structure defined above (Selective_Scan_fwd_kernel_traits)
+    
+    // What we are doing below is creating pointers of different types to the same memory that we plan to reuse #TODO: double check
+
+    // Also notice that Ktraits will be an instance of a structure defined above (Selective_Scan_fwd_kernel_traits)
     // So internally it will have a BlockLoadT member, defined so as to fit the specific setup in that particular traits object.
-    // Similarly for other lines below.
+
     auto& smem_load = reinterpret_cast<typename Ktraits::BlockLoadT::TempStorage&>(smem_);
     auto& smem_load_weight = reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage&>(smem_);
     auto& smem_load_weight1 = *reinterpret_cast<typename Ktraits::BlockLoadWeightT::TempStorage*>(smem_ + sizeof(typename Ktraits::BlockLoadWeightT::TempStorage));
@@ -147,8 +156,10 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     const int dim_id = blockIdx.y;
     const int group_id = dim_id / (params.dim_ngroups_ratio);
 
+    // Get S6 values relevant for this particular kernel/thread. 
     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
         + dim_id * kNRows * params.u_d_stride;
+
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + batch_id * params.delta_batch_stride
         + dim_id * kNRows * params.delta_d_stride;
     weight_t *A = reinterpret_cast<weight_t *>(params.A_ptr) + dim_id * kNRows * params.A_d_stride;
@@ -158,7 +169,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
     scan_t *x = reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.n_chunks * params.dstate;
 
-    float D_val[kNRows] = {0};
+    float D_val[kNRows] = {0}; // 
     if (params.D_ptr != nullptr) {
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
@@ -173,10 +184,11 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
         }
     }
 
-    // for (int state_idx = threadIdx.x; state_idx < params.dstate; state_idx += blockDim.x) {
-    //     smem_a[state_idx] = A[state_idx * params.A_dstate_stride];
-    //     smem_bc[state_idx] = B[state_idx * params.B_dstate_stride] * C[state_idx * params.C_dstate_stride];
-    // }
+    
+    // for (int state_idx = threadIdx.x; state_idx < params.dstate; state_idx += blockDim.x) {                 // original comment
+    //     smem_a[state_idx] = A[state_idx * params.A_dstate_stride];                                          // original comment
+    //     smem_bc[state_idx] = B[state_idx * params.B_dstate_stride] * C[state_idx * params.C_dstate_stride]; // original comment
+    // }                                                                                                       // original comment
 
     constexpr int kChunkSize = kNThreads * kNItems;
     for (int chunk = 0; chunk < params.n_chunks; ++chunk) {
@@ -357,16 +369,18 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
     // Only kNRows == 1 is tested for now, which ofc doesn't differ from previously when we had each block
     // processing 1 row.
     constexpr int kNRows = 1;
-    BOOL_SWITCH(params.seqlen % (kNThreads * kNItems) == 0, kIsEvenLen, [&] {
-        BOOL_SWITCH(params.is_variable_B, kIsVariableB, [&] {
-            BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] {
-                BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] {
+    BOOL_SWITCH(params.seqlen % (kNThreads * kNItems) == 0, kIsEvenLen, [&] { // we'd like to define kIsEvenLen as constexpr, hence the BOOL_SWITCH macro wrapper.
+        BOOL_SWITCH(params.is_variable_B, kIsVariableB, [&] { // same for kIsVariableB and the next two rows
+            BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] { // 
+                BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] { //
                     using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, input_t, weight_t>;
                     // constexpr int kSmemSize = Ktraits::kSmemSize;
                     constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
                     // printf("smem_size = %d\n", kSmemSize);
                     dim3 grid(params.batch, params.dim / kNRows);
-                    auto kernel = &selective_scan_fwd_kernel<Ktraits>;
+
+                    auto kernel = &selective_scan_fwd_kernel<Ktraits>; // Taking a function pointer here in order to 
+                                                                       // set/tweak the shared memory size before the actual kernel launch.
                     if (kSmemSize >= 48 * 1024) {
                         C10_CUDA_CHECK(cudaFuncSetAttribute(
                             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
