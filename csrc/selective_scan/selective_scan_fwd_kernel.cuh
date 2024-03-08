@@ -157,13 +157,12 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     const int dim_id = blockIdx.y;
     const int group_id = dim_id / (params.dim_ngroups_ratio);
 
-    // Get S6 values relevant for this particular kernel/thread. 
+    // Below: get S6 value pointers relevant for this particular kernel/thread. 
 
     // note that u (input) tensor dimension is B D L.
     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
         + dim_id * kNRows * params.u_d_stride;
-    // Note that since we are using cub's block scan, we running the scan & aggregating it across multiple threads in a block.
-
+    // Note that since we are using cub's block scan, we will be running the scan & aggregating across multiple threads in a block.
 
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + batch_id * params.delta_batch_stride
         + dim_id * kNRows * params.delta_d_stride;
@@ -174,7 +173,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     input_t *Cvar = reinterpret_cast<input_t *>(params.C_ptr) + batch_id * params.C_batch_stride + group_id * params.C_group_stride;
     scan_t *x = reinterpret_cast<scan_t *>(params.x_ptr) + (batch_id * params.dim + dim_id * kNRows) * params.n_chunks * params.dstate;
 
-    float D_val[kNRows] = {0}; // 
+    float D_val[kNRows] = {0};
     if (params.D_ptr != nullptr) {
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
@@ -202,14 +201,18 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
         #pragma unroll
         for (int r = 0; r < kNRows; ++r) {
             if constexpr (!kDirectIO) {
-                if (r > 0) { __syncthreads(); }
+                if (r > 0) { __syncthreads(); } // TODO: generally. conditional synchthreads is considered really dangerous, I'd need to check how this is supposed to work. NRows is usually 1, so this is untested and irrelevant.
             }
+
+            // see selective_scan_common.h for load_input definition. Uses cub's data managing primitives.
+            // written strangely substantially different depending on whether the length is even
+            // potential oversight as the code is mostly tested with even lengths (see tests/ops/test_selective_scan.py line 20)
             load_input<Ktraits>(u + r * params.u_d_stride, u_vals[r], smem_load, params.seqlen - chunk * kChunkSize);
-            if constexpr (!kDirectIO) { __syncthreads(); }
+            if constexpr (!kDirectIO) { __syncthreads(); } // this conditional syncing is okay, since it will always be executed for all threads or for none.
             load_input<Ktraits>(delta + r * params.delta_d_stride, delta_vals_load[r], smem_load, params.seqlen - chunk * kChunkSize);
         }
-        u += kChunkSize;
-        delta += kChunkSize;
+        u += kChunkSize; // advance pointers
+        delta += kChunkSize; // advance pointers 
 
         float delta_vals[kNRows][kNItems], delta_u_vals[kNRows][kNItems], out_vals[kNRows][kNItems];
         #pragma unroll
@@ -219,6 +222,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 float u_val = float(u_vals[r][i]);
                 delta_vals[r][i] = float(delta_vals_load[r][i]) + delta_bias[r];
                 if (params.delta_softplus) {
+                            // above 20.0 (arbitrary) softplus is close enough to linear, so the authors bypass it. 
                     delta_vals[r][i] = delta_vals[r][i] <= 20.f ? log1pf(expf(delta_vals[r][i])) : delta_vals[r][i];
                 }
                 delta_u_vals[r][i] = delta_vals[r][i] * u_val;
@@ -226,13 +230,19 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
             }
         }
 
+        
+        
         __syncthreads();
+        // The loop below does a lot of work, going over the hidden state dimensions and handling them one by one.
+        // The cub scan is applied to one hidden dimension at at a time.
         for (int state_idx = 0; state_idx < params.dstate; ++state_idx) {
-            weight_t A_val[kNRows];
+
+            // Below - load values of A looping over hidden state dimensions.
+            weight_t A_val[kNRows]; // kNRows is tested with a value of 1.
             #pragma unroll
             for (int r = 0; r < kNRows; ++r) {
                 A_val[r] = A[state_idx * params.A_dstate_stride + r * params.A_d_stride];
-                // Multiply the real part of A with LOG2E so we can use exp2f instead of expf.
+                // Multiply the real part of A with LOG2E so we can use exp2f instead of expf. // original comment
                 constexpr float kLog2e = M_LOG2E;
                 if constexpr (!kIsComplex) {
                     A_val[r] *= kLog2e;
@@ -240,9 +250,11 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                     A_val[r].real_ *= kLog2e;
                 }
             }
-            // This variable holds B * C if both B and C are constant across seqlen. If only B varies
-            // across seqlen, this holds C. If only C varies across seqlen, this holds B.
-            // If both B and C vary, this is unused.
+            // This variable holds B * C if both B and C are constant across seqlen. If only B varies // original comment
+            // across seqlen, this holds C. If only C varies across seqlen, this holds B. // original comment
+            // If both B and C vary, this is unused. // original comment
+
+            //Next few code blocks - load B and C values
             weight_t BC_val[kNRows];
             weight_t B_vals[kNItems], C_vals[kNItems];
             if constexpr (kIsVariableB) {
@@ -272,49 +284,54 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                     BC_val[r] = B[state_idx * params.B_dstate_stride + r * params.B_d_stride] * C[state_idx * params.C_dstate_stride + r * params.C_d_stride];
                 }
             }
+            // Done loading B and C 
 
             #pragma unroll
             for (int r = 0; r < kNRows; ++r) {
-                if (r > 0) { __syncthreads(); }  // Scan could be using the same smem
-                scan_t thread_data[kNItems];
+                if (r > 0) { __syncthreads(); }  // Scan could be using the same smem // original comment
+                scan_t thread_data[kNItems]; // note that thread data will hold the key pairs for scanning over.
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     if constexpr (!kIsComplex) {
+                        
+                        // note that we are discretizing A when constructing the first element of the pair.
+                        // TODO: where/when does B discretization happen? Could be implicit in some other part of the code.
                         thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]),
                                                      !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
-                        if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
+                        if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct // original comment
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                                 thread_data[i] = make_float2(1.f, 0.f);
                             }
                         }
                     } else {
-                        // Pytorch's implementation of complex exp (which calls thrust) is very slow
+                        // Pytorch's implementation of complex exp (which calls thrust) is very slow // original comment
                         complex_t delta_a_exp = cexp2f(delta_vals[r][i] * A_val[r]);
                         weight_t B_delta_u_val = !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i];
                         thread_data[i] = make_float4(delta_a_exp.real_, delta_a_exp.imag_, B_delta_u_val.real_, B_delta_u_val.imag_);
-                        if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct
+                        if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct // original comment
                             if (threadIdx.x * kNItems + i >= params.seqlen - chunk * kChunkSize) {
                                 thread_data[i] = make_float4(1.f, 0.f, 0.f, 0.f);
                             }
                         }
                     }
                 }
-                // Initialize running total
+                // Initialize running total // original comment
                 scan_t running_prefix;
                 if constexpr (!kIsComplex) {
-                    // If we use WARP_SCAN then all lane 0 of all warps (not just thread 0) needs to read
+                    // If we use WARP_SCAN then all lane 0 of all warps (not just thread 0) needs to read // original comment
                     running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float2(1.f, 0.f);
-                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float2(1.f, 0.f);
+                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float2(1.f, 0.f); // original comment
                 } else {
                     running_prefix = chunk > 0 && threadIdx.x % 32 == 0 ? smem_running_prefix[state_idx + r * MAX_DSTATE] : make_float4(1.f, 0.f, 0.f, 0.f);
-                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float4(1.f, 0.f, 0.f, 0.f);
+                    // running_prefix = chunk > 0 && threadIdx.x == 0 ? smem_running_prefix[state_idx] : make_float4(1.f, 0.f, 0.f, 0.f); // original comment
                 }
                 SSMScanPrefixCallbackOp<weight_t> prefix_op(running_prefix);
                 Ktraits::BlockScanT(smem_scan).InclusiveScan(
                     thread_data, thread_data, SSMScanOp<weight_t>(), prefix_op
                 );
-                // There's a syncthreads in the scan op, so we don't need to sync here.
-                // Unless there's only 1 warp, but then it's the same thread (0) reading and writing.
+                // There's a syncthreads in the scan op, so we don't need to sync here. // original comment 
+                // Unless there's only 1 warp, but then it's the same thread (0) reading and writing.// original comment
+
                 if (threadIdx.x == 0) {
                     smem_running_prefix[state_idx] = prefix_op.running_prefix;
                     x[(r * params.n_chunks + chunk) * params.dstate + state_idx] = prefix_op.running_prefix;
@@ -371,17 +388,18 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
 
 template<int kNThreads, int kNItems, typename input_t, typename weight_t>
 void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
-    // Only kNRows == 1 is tested for now, which ofc doesn't differ from previously when we had each block
-    // processing 1 row.
+    // Only kNRows == 1 is tested for now, which ofc doesn't differ from previously when we had each block // original comment
+    // processing 1 row. // original comment
+
     constexpr int kNRows = 1;
     BOOL_SWITCH(params.seqlen % (kNThreads * kNItems) == 0, kIsEvenLen, [&] { // we'd like to define kIsEvenLen as constexpr, hence the BOOL_SWITCH macro wrapper.
         BOOL_SWITCH(params.is_variable_B, kIsVariableB, [&] { // same for kIsVariableB and the next two rows
             BOOL_SWITCH(params.is_variable_C, kIsVariableC, [&] { // 
                 BOOL_SWITCH(params.z_ptr != nullptr , kHasZ, [&] { //
                     using Ktraits = Selective_Scan_fwd_kernel_traits<kNThreads, kNItems, kNRows, kIsEvenLen, kIsVariableB, kIsVariableC, kHasZ, input_t, weight_t>;
-                    // constexpr int kSmemSize = Ktraits::kSmemSize;
+                    // constexpr int kSmemSize = Ktraits::kSmemSize; // original comment
                     constexpr int kSmemSize = Ktraits::kSmemSize + kNRows * MAX_DSTATE * sizeof(typename Ktraits::scan_t);
-                    // printf("smem_size = %d\n", kSmemSize);
+                    // printf("smem_size = %d\n", kSmemSize); // original comment
                     dim3 grid(params.batch, params.dim / kNRows);
 
                     auto kernel = &selective_scan_fwd_kernel<Ktraits>; // Taking a function pointer here in order to 
@@ -398,6 +416,9 @@ void selective_scan_fwd_launch(SSMParamsBase &params, cudaStream_t stream) {
     });
 }
 
+
+// Below making a template over input types, so that later we can instantiate them in separate files.
+// This helps with compilation speed (we can compile for different datatypes in parallel).
 template<typename input_t, typename weight_t>
 void selective_scan_fwd_cuda(SSMParamsBase &params, cudaStream_t stream) {
     if (params.seqlen <= 128) {
