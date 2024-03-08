@@ -108,7 +108,8 @@ __device__ __forceinline__ complex_t cexpf(complex_t z) {
 template<typename scalar_t> struct SSMScanOp;
 
 template<>
-struct SSMScanOp<float> {
+struct SSMScanOp<float> { // see SIMPLIFIED STATE SPACE LAYERS FOR SEQUENCE MODELING Jimmy T.H. Smith, Andrew Warrington, Scott W. Linderman 2023, 
+                          // code below implements equation 34
     __device__ __forceinline__ float2 operator()(const float2 &ab0, const float2 &ab1) const {
         return make_float2(ab1.x * ab0.x, ab1.x * ab0.y + ab1.y);
     }

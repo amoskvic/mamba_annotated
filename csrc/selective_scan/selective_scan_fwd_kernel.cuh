@@ -296,6 +296,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                         
                         // note that we are discretizing A when constructing the first element of the pair.
                         // TODO: where/when does B discretization happen? Could be implicit in some other part of the code.
+                        // Conceptually, the code follows equation 33 in "SIMPLIFIED STATE SPACE LAYERS FOR SEQUENCE MODELING"
                         thread_data[i] = make_float2(exp2f(delta_vals[r][i] * A_val[r]),
                                                      !kIsVariableB ? delta_u_vals[r][i] : B_vals[i] * delta_u_vals[r][i]);
                         if constexpr (!Ktraits::kIsEvenLen) {  // So that the last state is correct // original comment
