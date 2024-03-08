@@ -33,7 +33,7 @@ intended to make CUDA code easier to write and more modular/composable. See http
                                    // Also defines some type converters.
                                    // Perhaps most importantly, defines a SSMScanOp template which gives the key scan 
                                    // element (a pair for real-valued, a quadruple for complex ones) needed for the 
-                                   // parallel scan algorithm to work.
+                                   // parallel scan algorithm to work. # TODO: link to the paper with theory on this.
 
 #include "static_switch.h" // conditional code execution lambda macro.
 
@@ -115,13 +115,14 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     constexpr bool kIsVariableC = Ktraits::kIsVariableC;
     constexpr bool kHasZ = Ktraits::kHasZ; // TODO
     constexpr int kNThreads = Ktraits::kNThreads;
-    constexpr int kNItems = Ktraits::kNItems; // TODO
+    constexpr int kNItems = Ktraits::kNItems; // How many elements of the input sequence to process per thread. Notice that CUB aggregates across threads in a block, so we only need to process a part of the sequence per thread. See 'A Simple Example' here: https://nvidia.github.io/cccl/cub/api/classcub_1_1BlockScan.html
     constexpr int kNRows = Ktraits::kNRows; // Is actualy set to 1 in the kernel launch and is not tested with other values.
     constexpr bool kDirectIO = Ktraits::kDirectIO; // TODO
-    using input_t = typename Ktraits::input_t;
-    using weight_t = typename Ktraits::weight_t;
+    using input_t = typename Ktraits::input_t; // input type
+    using weight_t = typename Ktraits::weight_t; // weight type
     using scan_t = typename Ktraits::scan_t; // The type of the scan variable, will be float2 or float4 vector depending on 
-                                             // whether we're working with a complex case or not.
+                                             // whether we're working with a complex case or not. Needs 2 elements even for the real case to 
+                                             // parameterize the process to fit the scan algorithm.
 =
     // Shared memory. // original comment
     // See more here https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/
@@ -157,8 +158,12 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
     const int group_id = dim_id / (params.dim_ngroups_ratio);
 
     // Get S6 values relevant for this particular kernel/thread. 
+
+    // note that u (input) tensor dimension is B D L.
     input_t *u = reinterpret_cast<input_t *>(params.u_ptr) + batch_id * params.u_batch_stride
         + dim_id * kNRows * params.u_d_stride;
+    // Note that since we are using cub's block scan, we running the scan & aggregating it across multiple threads in a block.
+
 
     input_t *delta = reinterpret_cast<input_t *>(params.delta_ptr) + batch_id * params.delta_batch_stride
         + dim_id * kNRows * params.delta_d_stride;
